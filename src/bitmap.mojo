@@ -1,4 +1,6 @@
 from std.sys.info import simd_width_of as simdwidthof
+from max.algorithm import parallelize
+from std.bit import count_trailing_zeros
 
 
 comptime U16Ptr = UnsafePointer[UInt16, AnyOrigin[mut=True]]
@@ -17,6 +19,7 @@ def popcount(value: UInt64) -> Int:
 
 
 def array_union(a: U16Ptr, na: Int, b: U16Ptr, nb: Int, dst: U16Ptr) -> Int:
+    comptime W = simdwidthof[DType.float64]()
     var i = 0
     var j = 0
     var n = 0
@@ -32,10 +35,18 @@ def array_union(a: U16Ptr, na: Int, b: U16Ptr, nb: Int, dst: U16Ptr) -> Int:
             i += 1
             j += 1
         n += 1
+    while i + W <= na:
+        dst.store(n, a.load[width=W](i))
+        i += W
+        n += W
     while i < na:
         dst[n] = a[i]
         i += 1
         n += 1
+    while j + W <= nb:
+        dst.store(n, b.load[width=W](j))
+        j += W
+        n += W
     while j < nb:
         dst[n] = b[j]
         j += 1
@@ -65,6 +76,7 @@ def array_intersection(
 def array_difference(
     a: U16Ptr, na: Int, b: U16Ptr, nb: Int, dst: U16Ptr
 ) -> Int:
+    comptime W = simdwidthof[DType.float64]()
     var i = 0
     var j = 0
     var n = 0
@@ -78,6 +90,10 @@ def array_difference(
         else:
             i += 1
             j += 1
+    while i + W <= na:
+        dst.store(n, a.load[width=W](i))
+        i += W
+        n += W
     while i < na:
         dst[n] = a[i]
         i += 1
@@ -86,6 +102,7 @@ def array_difference(
 
 
 def array_xor(a: U16Ptr, na: Int, b: U16Ptr, nb: Int, dst: U16Ptr) -> Int:
+    comptime W = simdwidthof[DType.float64]()
     var i = 0
     var j = 0
     var n = 0
@@ -101,10 +118,18 @@ def array_xor(a: U16Ptr, na: Int, b: U16Ptr, nb: Int, dst: U16Ptr) -> Int:
         else:
             i += 1
             j += 1
+    while i + W <= na:
+        dst.store(n, a.load[width=W](i))
+        i += W
+        n += W
     while i < na:
         dst[n] = a[i]
         i += 1
         n += 1
+    while j + W <= nb:
+        dst.store(n, b.load[width=W](j))
+        j += W
+        n += W
     while j < nb:
         dst[n] = b[j]
         j += 1
@@ -146,11 +171,11 @@ def bitset_to_array(a: U64Ptr, dst: U16Ptr) -> Int:
     var n = 0
     for word_index in range(1024):
         var word = a[word_index]
-        if word != 0:
-            for bit in range(64):
-                if (word & (UInt64(1) << UInt64(bit))) != 0:
-                    dst[n] = UInt16(word_index * 64 + bit)
-                    n += 1
+        while word != 0:
+            var bit = Int(count_trailing_zeros(word))
+            dst[n] = UInt16(word_index * 64 + bit)
+            n += 1
+            word &= word - 1
     return n
 
 
@@ -227,8 +252,15 @@ def array_binary_batch(
     total_values: Int,
     operation: Int,
 ):
-    @parameter
-    def process(index: Int):
+    def process(index: Int) {
+        imm a_addrs_addr,
+        imm a_sizes_addr,
+        imm b_addrs_addr,
+        imm b_sizes_addr,
+        imm dst_addrs_addr,
+        imm cardinalities_addr,
+        imm operation,
+    }:
         var a_addrs = U64Ptr(unsafe_from_address=a_addrs_addr)
         var a_sizes = I64Ptr(unsafe_from_address=a_sizes_addr)
         var b_addrs = U64Ptr(unsafe_from_address=b_addrs_addr)
@@ -257,8 +289,11 @@ def array_binary_batch(
             )
         cardinalities[index] = Int64(cardinality)
 
-    for index in range(count):
-        process(index)
+    if count >= 8 and total_values > 0:
+        parallelize(process, count, min(count, 4))
+    else:
+        for index in range(count):
+            process(index)
 
 
 def array_intersection_cardinality_batch(

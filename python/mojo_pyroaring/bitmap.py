@@ -4,7 +4,7 @@ from array import array
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import operator
 from threading import Lock
 from typing import Any
@@ -19,6 +19,7 @@ WORDS_PER_CONTAINER = 1024
 _OPERATIONS = {"union": 0, "intersection": 1, "difference": 2, "xor": 3}
 BATCH_MIN_CONTAINERS = 4
 PARALLEL_ARRAY_VALUES = 200_000
+MOJO_PARALLEL_ARRAY_VALUES = 4_000_000
 PARALLEL_WORKERS = 4
 _executor: ThreadPoolExecutor | None = None
 _executor_lock = Lock()
@@ -50,6 +51,7 @@ class _Container:
     data: np.ndarray
     cardinality: int
     rank_prefix: np.ndarray | None = None
+    native_address: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.data.flags.c_contiguous or not self.data.flags.aligned:
@@ -66,6 +68,7 @@ class _Container:
                 raise ValueError("invalid bitset-container storage")
         else:
             raise TypeError("container storage must use uint16 or uint64")
+        self.native_address = int(self.data.ctypes.data)
         self.data.flags.writeable = False
 
     @property
@@ -73,11 +76,12 @@ class _Container:
         return self.data.dtype == np.uint64
 
     def copy(self) -> "_Container":
-        return _Container(self.data, self.cardinality, self.rank_prefix)
+        return self
 
 
 _FULL_BITSET = np.full(WORDS_PER_CONTAINER, np.uint64(0xFFFFFFFFFFFFFFFF))
 _FULL_BITSET.flags.writeable = False
+_FULL_CONTAINER = _Container(_FULL_BITSET, 1 << 16)
 
 
 def _parallel_executor() -> ThreadPoolExecutor:
@@ -102,7 +106,7 @@ def _array_to_dense(container: _Container) -> np.ndarray:
         return container.data
     result = np.empty(WORDS_PER_CONTAINER, dtype=np.uint64)
     lib().mpr_array_to_bitset(
-        address(container.data), container.cardinality, address(result)
+        container.native_address, container.cardinality, address(result)
     )
     return result
 
@@ -133,9 +137,9 @@ def _container_binary(
         result = np.empty(max(capacity, 1), dtype=np.uint16)
         function = getattr(kernel, f"mpr_array_{operation}")
         cardinality = function(
-            address(left.data),
+            left.native_address,
             left.cardinality,
-            address(right.data),
+            right.native_address,
             right.cardinality,
             address(result),
         )
@@ -152,8 +156,8 @@ def _container_binary(
     right_bits = _array_to_dense(right)
     result_bits = np.empty(WORDS_PER_CONTAINER, dtype=np.uint64)
     cardinality = kernel.mpr_bitset_binary(
-        address(left_bits),
-        address(right_bits),
+        int(left_bits.ctypes.data),
+        int(right_bits.ctypes.data),
         address(result_bits),
         _OPERATIONS[operation],
     )
@@ -164,17 +168,17 @@ def _batch_array_binary_serial(
     pairs: list[tuple[int, _Container, _Container]], operation: str
 ) -> list[tuple[int, _Container | None]]:
     count = len(pairs)
-    left_addresses = np.fromiter(
-        (address(left.data) for _, left, _ in pairs), dtype=np.uint64, count=count
+    left_addresses = np.asarray(
+        [left.native_address for _, left, _ in pairs], dtype=np.uint64
     )
-    right_addresses = np.fromiter(
-        (address(right.data) for _, _, right in pairs), dtype=np.uint64, count=count
+    right_addresses = np.asarray(
+        [right.native_address for _, _, right in pairs], dtype=np.uint64
     )
-    left_sizes = np.fromiter(
-        (left.cardinality for _, left, _ in pairs), dtype=np.int64, count=count
+    left_sizes = np.asarray(
+        [left.cardinality for _, left, _ in pairs], dtype=np.int64
     )
-    right_sizes = np.fromiter(
-        (right.cardinality for _, _, right in pairs), dtype=np.int64, count=count
+    right_sizes = np.asarray(
+        [right.cardinality for _, _, right in pairs], dtype=np.int64
     )
     if operation in ("union", "xor"):
         capacities = left_sizes + right_sizes
@@ -192,6 +196,7 @@ def _batch_array_binary_serial(
         address(values) + offsets * values.itemsize, dtype=np.uint64
     )
     cardinalities = np.empty(count, dtype=np.int64)
+    total_values = int(left_sizes.sum() + right_sizes.sum())
     lib().mpr_array_binary_batch(
         address(left_addresses),
         address(left_sizes),
@@ -200,7 +205,7 @@ def _batch_array_binary_serial(
         address(destination_addresses),
         address(cardinalities),
         count,
-        int(left_sizes.sum() + right_sizes.sum()),
+        total_values if total_values >= MOJO_PARALLEL_ARRAY_VALUES else 0,
         _OPERATIONS[operation],
     )
     results: list[tuple[int, _Container | None]] = []
@@ -227,6 +232,8 @@ def _batch_array_binary(
     total_values = sum(
         left.cardinality + right.cardinality for _, left, right in pairs
     )
+    if total_values >= MOJO_PARALLEL_ARRAY_VALUES:
+        return _batch_array_binary_serial(pairs, operation)
     if len(pairs) < PARALLEL_WORKERS * 2 or total_values < PARALLEL_ARRAY_VALUES:
         return _batch_array_binary_serial(pairs, operation)
     chunk_size = (len(pairs) + PARALLEL_WORKERS - 1) // PARALLEL_WORKERS
@@ -248,11 +255,11 @@ def _batch_dense_binary(
     pairs: list[tuple[int, _Container, _Container]], operation: str
 ) -> list[tuple[int, _Container | None]]:
     count = len(pairs)
-    left_addresses = np.fromiter(
-        (address(left.data) for _, left, _ in pairs), dtype=np.uint64, count=count
+    left_addresses = np.asarray(
+        [left.native_address for _, left, _ in pairs], dtype=np.uint64
     )
-    right_addresses = np.fromiter(
-        (address(right.data) for _, _, right in pairs), dtype=np.uint64, count=count
+    right_addresses = np.asarray(
+        [right.native_address for _, _, right in pairs], dtype=np.uint64
     )
     result_bits = np.empty((count, WORDS_PER_CONTAINER), dtype=np.uint64)
     cardinalities = np.empty(count, dtype=np.int64)
@@ -280,9 +287,9 @@ def _container_intersection_cardinality(
     if not left.dense and not right.dense:
         return int(
             kernel.mpr_array_intersection_cardinality(
-                address(left.data),
+                left.native_address,
                 left.cardinality,
-                address(right.data),
+                right.native_address,
                 right.cardinality,
             )
         )
@@ -301,17 +308,17 @@ def _batch_array_intersection_cardinality(
     pairs: list[tuple[_Container, _Container]],
 ) -> int:
     count = len(pairs)
-    left_addresses = np.fromiter(
-        (address(left.data) for left, _ in pairs), dtype=np.uint64, count=count
+    left_addresses = np.asarray(
+        [left.native_address for left, _ in pairs], dtype=np.uint64
     )
-    right_addresses = np.fromiter(
-        (address(right.data) for _, right in pairs), dtype=np.uint64, count=count
+    right_addresses = np.asarray(
+        [right.native_address for _, right in pairs], dtype=np.uint64
     )
-    left_sizes = np.fromiter(
-        (left.cardinality for left, _ in pairs), dtype=np.int64, count=count
+    left_sizes = np.asarray(
+        [left.cardinality for left, _ in pairs], dtype=np.int64
     )
-    right_sizes = np.fromiter(
-        (right.cardinality for _, right in pairs), dtype=np.int64, count=count
+    right_sizes = np.asarray(
+        [right.cardinality for _, right in pairs], dtype=np.int64
     )
     return int(
         lib().mpr_array_intersection_cardinality_batch(
@@ -329,11 +336,11 @@ def _batch_dense_intersection_cardinality(
     pairs: list[tuple[_Container, _Container]],
 ) -> int:
     count = len(pairs)
-    left_addresses = np.fromiter(
-        (address(left.data) for left, _ in pairs), dtype=np.uint64, count=count
+    left_addresses = np.asarray(
+        [left.native_address for left, _ in pairs], dtype=np.uint64
     )
-    right_addresses = np.fromiter(
-        (address(right.data) for _, right in pairs), dtype=np.uint64, count=count
+    right_addresses = np.asarray(
+        [right.native_address for _, right in pairs], dtype=np.uint64
     )
     return int(
         lib().mpr_bitset_intersection_cardinality_batch(
@@ -359,7 +366,7 @@ def _full_range_container(start: int, end: int) -> _Container:
     if cardinality <= ARRAY_LIMIT:
         return _array_container(np.arange(start, end, dtype=np.uint16))
     if cardinality == 1 << 16:
-        return _Container(_FULL_BITSET, cardinality)
+        return _FULL_CONTAINER
     bits = np.zeros(WORDS_PER_CONTAINER, dtype=np.uint64)
     first_word = start >> 6
     last_word = (end - 1) >> 6
@@ -529,7 +536,7 @@ class AbstractBitMap:
             high = key << 16
             if container.dense:
                 lows = np.empty(container.cardinality, dtype=np.uint16)
-                lib().mpr_bitset_to_array(address(container.data), address(lows))
+                lib().mpr_bitset_to_array(container.native_address, address(lows))
             else:
                 lows = container.data
             for low in lows:
@@ -577,7 +584,7 @@ class AbstractBitMap:
                 remaining -= container.cardinality
                 continue
             if container.dense:
-                low = int(lib().mpr_bitset_select(address(container.data), remaining))
+                low = int(lib().mpr_bitset_select(container.native_address, remaining))
             else:
                 low = int(container.data[remaining])
             return (key << 16) | low

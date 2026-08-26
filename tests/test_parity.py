@@ -166,9 +166,32 @@ def test_simd_rank_tail_and_parallel_batch_threshold(monkeypatch):
     theirs_right = upstream.BitMap(right_values)
 
     monkeypatch.setattr(implementation, "PARALLEL_ARRAY_VALUES", 10**9)
+    monkeypatch.setattr(implementation, "MOJO_PARALLEL_ARRAY_VALUES", 10**9)
     same(ours_left | ours_right, theirs_left | theirs_right)
     monkeypatch.setattr(implementation, "PARALLEL_ARRAY_VALUES", 1)
     same(ours_left - ours_right, theirs_left - theirs_right)
+    monkeypatch.setattr(implementation, "PARALLEL_ARRAY_VALUES", 10**9)
+    monkeypatch.setattr(implementation, "MOJO_PARALLEL_ARRAY_VALUES", 1)
+    same(ours_left ^ ours_right, theirs_left ^ theirs_right)
+
+
+def test_simd_merge_remainders_and_bitset_materialization():
+    left_values = [1]
+    right_values = [1, 5, 6, 7, 8, 9, 10]
+    ours_left, ours_right = BitMap(left_values), BitMap(right_values)
+    theirs_left = upstream.BitMap(left_values)
+    theirs_right = upstream.BitMap(right_values)
+    for operation in ("union", "difference", "symmetric_difference"):
+        same(
+            getattr(ours_right, operation)(ours_left),
+            getattr(theirs_right, operation)(theirs_left),
+        )
+
+    ours_dense = BitMap(range(1 << 16))
+    theirs_dense = upstream.BitMap(range(1 << 16))
+    ours_sparse = BitMap(range(3, 6000, 7))
+    theirs_sparse = upstream.BitMap(range(3, 6000, 7))
+    same(ours_dense & ours_sparse, theirs_dense & theirs_sparse)
 
 
 def test_ranges_queries_and_next_iteration():

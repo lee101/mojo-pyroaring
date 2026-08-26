@@ -94,7 +94,10 @@ containers are views into shared NumPy slabs instead of per-container copies.
 The Mojo compilation unit implements sorted array merges, SIMD wordwise bitset
 algebra and popcount cardinalities, array/bitset conversion, rank, and select.
 Large independent array-container batches use a four-worker host pool above a
-200,000-value threshold; smaller batches stay serial. There is no GPU path.
+200,000-value threshold and Mojo `parallelize` above 4,000,000 values; smaller
+batches stay serial. There is no GPU path: the bitmap kernels perform roughly
+one bitwise operation per 16--24 bytes moved, far below the arithmetic
+intensity where device transfer and launch overhead can pay off.
 
 ## Benchmarks
 
@@ -104,13 +107,13 @@ the benchmark constructs both bitmap inputs before timing each operation.
 
 | operation | mojo-pyroaring | pyroaring 1.0.4 | upstream / Mojo |
 |---|---:|---:|---:|
-| dense union (2.5M / 1.7M) | 0.8422 ms | 0.1077 ms | 0.13x (Mojo slower) |
-| dense intersection (2.5M / 1.7M) | 0.5614 ms | 0.0881 ms | 0.16x (Mojo slower) |
-| dense intersection cardinality | 0.3282 ms | 0.0324 ms | 0.10x (Mojo slower) |
-| sparse union (400k / 400k) | 3.2510 ms | 0.9499 ms | 0.29x (Mojo slower) |
-| sparse difference (400k / 400k) | 4.8814 ms | 0.4769 ms | 0.10x (Mojo slower) |
-| rank at 4,000,000 | 0.0013 ms | 0.0006 ms | 0.43x (Mojo slower) |
-| construct range(5,000,000) | 0.2263 ms | 0.0155 ms | 0.07x (Mojo slower) |
+| dense union (2.5M / 1.7M) | 0.3588 ms | 0.0997 ms | 0.28x (Mojo slower) |
+| dense intersection (2.5M / 1.7M) | 0.4244 ms | 0.0876 ms | 0.21x (Mojo slower) |
+| dense intersection cardinality | 0.1048 ms | 0.0313 ms | 0.30x (Mojo slower) |
+| sparse union (400k / 400k) | 2.6049 ms | 0.9579 ms | 0.37x (Mojo slower) |
+| sparse difference (400k / 400k) | 4.1284 ms | 0.7070 ms | 0.17x (Mojo slower) |
+| rank at 4,000,000 | 0.0019 ms | 0.0006 ms | 0.30x (Mojo slower) |
+| construct range(5,000,000) | 0.0371 ms | 0.0148 ms | 0.40x (Mojo slower) |
 
 Upstream remains faster in every measured case. It is a thin Cython binding to
 the heavily optimized CRoaring C library and benefits from run containers,
